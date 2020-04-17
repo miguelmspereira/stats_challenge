@@ -1,0 +1,22 @@
+---
+title: "Coding Challenge"
+author: "Miguel Pereira"
+date: "4/10/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(data.table)
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+library(caret)
+#library()
+
+grid.data<-fread('gridwatch.csv')
+head(grid.data)
+```
+
+# Data
+
+The Gridwatch dataset provides historical UK power consumption spanning 8 years, starting on 27/05/2011. The dataset has ``` nrow(grid.data)``` entries and includes the powerconsumption (```demand```) and a timestamp for the day and time the measurement was collected.
