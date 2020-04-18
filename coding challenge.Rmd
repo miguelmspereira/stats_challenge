@@ -1,8 +1,12 @@
 ---
 title: "Coding Challenge"
 author: "Miguel Pereira"
-date: "4/10/2020"
-output: html_document
+date: "17/04/2020"
+output:  
+  html_document:
+    toc: yes
+    toc_depth: 4
+    toc_float: yes
 ---
 
 ```{r setup, include=FALSE}
@@ -11,12 +15,277 @@ library(dplyr)
 library(tidyverse)
 library(ggplot2)
 library(caret)
+library(forecast)
+library(tseries)
+library(gridExtra)
 #library()
 
-grid.data<-fread('gridwatch.csv')
-head(grid.data)
+grid<-fread('gridwatch.csv')
+head(grid)
+grid$timestamp<-as.Date(grid$timestamp)
+
+grid<-grid %>%
+    mutate(day = parse_date(format(timestamp, "%Y-%m-%d")),
+         week = week(day),
+         month = format(timestamp, "%m"),
+         year = format(timestamp, "%Y"))
+head(grid)
+
 ```
 
-# Data
+<br>
 
-The Gridwatch dataset provides historical UK power consumption spanning 8 years, starting on 27/05/2011. The dataset has ``` nrow(grid.data)``` entries and includes the powerconsumption (```demand```) and a timestamp for the day and time the measurement was collected.
+## Introduction
+
+This document describes the approach taken to build a simple model to forecast power consumption over the next week in the UK using the Gridwatch dataset.
+
+The document is organised as follows:
+
+1. Dataset
+2. Data exploration
+3. Modelling
+4. Discussion
+
+<br>
+
+## Dataset
+
+The Gridwatch dataset provides historical UK power consumption spanning 8 years, starting on 27/05/2011. The dataset has ``` 933,118``` entries and includes the power consumption (```demand```) and a timestamp for the day the measurement was collected.
+
+The dataset also contains data on the demand split by each time of power source.
+For simplicity, I will take into account only the overall demand, which is the sum of all the different power sources.
+
+I will also use the timestamp values to create variables for year, month and week so that I can see seasonality and potential trends.
+
+
+
+
+<br>
+
+## Data exploration
+
+First, I will look at the power consumption, summarise the data and plot its distribution:
+
+```{r outcome, include=TRUE,echo=FALSE,warning=FALSE}
+#Summary
+summary(grid$demand)
+
+p1<-grid %>% ggplot(aes(x=1,y=demand)) +
+  geom_boxplot() +ylab("Power consumption")+ggtitle('Power consumption, all measurements')+xlab('')
+
+p2<-grid %>% ggplot(aes(x=1,y=demand)) +
+  geom_boxplot(outlier.shape=NA) +ylab("Power consumption")+ggtitle('Power consumption,no outliers') +ylim(c(0,65000))+xlab('')
+
+grid.arrange(p1,p2,ncol=2)
+
+
+```
+
+First important points:
+
+* There are no missing values
+* There are many outliers.
+
+To have an idea of how power consumption varies across time, I will build some plots.
+
+```{r plots, include=TRUE,echo=FALSE,warning=FALSE}
+#Overall
+grid %>% ggplot(aes(x=day, y=demand)) + geom_line() +
+  xlab("Time") + ylab("Power consumption")+ggtitle('Power consumption over time')+
+  ylim(c(0,75000))
+
+grid %>% filter(day=="2018-03-27") %>% ggplot(aes(x=day, y=demand)) + geom_line() +
+  xlab("Time") + ylab("Power consumption")+ggtitle('Power consumption on 27 March 2018 (example of a day)')+
+  ylim(c(0,75000))
+
+grid %>% filter(week==22) %>% ggplot(aes(x=day, y=demand)) + geom_line() +
+  xlab("Time") + ylab("Power consumption")+ggtitle('Power consumption on the 22nd week of year (example of a week)')+
+  ylim(c(0,75000))
+
+#By year
+grid %>% ggplot( aes(year, demand,col=year)) +
+  geom_boxplot(outlier.shape=NA) + 
+  stat_boxplot(geom ='errorbar')+
+  xlab("Year") + ylab("Power consumption")+ggtitle('Power consumption by Year')+
+  ylim(c(15000,65000))+ theme(legend.position = "none")
+
+#By month
+grid %>% ggplot( aes(month, demand,col=month)) +
+  geom_boxplot(outlier.shape=NA) + 
+  stat_boxplot(geom ='errorbar')+
+  xlab("Month") + ylab("Power consumption")+ggtitle('Power consumption by Month')+
+  ylim(c(15000,65000))+ theme(legend.position = "none")
+
+#By week
+grid %>% ggplot(aes(as.factor(week), demand,col=as.factor(week))) +
+  geom_boxplot(outlier.shape=NA) + 
+  stat_boxplot(geom ='errorbar')+
+  xlab("Week") + ylab("Power consumption")+ggtitle('Power consumption by week')+
+  ylim(c(15000,65000))+ theme(legend.position = "none")
+
+
+```
+
+From these plots, it is possible to observe some interesting features:
+
+* Some days have more than one measurement and there is no time recorded, there is only an individual ID recorded. It is not clear from the website if these are measurements at different points in time or from different locations. Due to this, I will take the average measurement recorded on each day. 
+* There are several big spikes in power (outliers) which may correspond to erroneous measurements. This is important to take into account.
+* There is a trend for a reduction in power consumption accross the different years. Data from 2020 shows a slight increase likely due to the fact that the data collected so far corresponds to the Winter months where the consumption is higher. However, this suggests that this time series is not stationary and that a model might tend to overestimate consumption.
+* There is seasonality in power consumption with more consumption in the months of November through February likely due to the use of heating systems during the Winter.
+* There is some weekly variation in power consumption but it seems to translate mostly the trends by year and month.
+
+<br>
+
+I will take the average measurement per day and re-plot the time series. This will make the data less volatile and will reduce the spikes.
+
+This will also make the measurements equally space in time.
+
+
+```{r proc, include=TRUE,echo=FALSE,warning=FALSE}
+grid.daymean<-tapply(grid$demand,as.factor(grid$timestamp),mean)
+
+grid2<-data.frame(
+  timestamp=unique(grid$timestamp),
+  demand=grid.daymean
+)    
+
+grid2<-grid2 %>% mutate(day = parse_date(format(timestamp, "%Y-%m-%d")),
+         week = week(day),
+         month = format(timestamp, "%m"),
+         year = format(timestamp, "%Y"))
+
+
+#Overall
+grid2 %>% ggplot(aes(x=day, y=demand)) + geom_line() +
+  xlab("Time") + ylab("Power consumption")+ggtitle('Power consumption over time')+
+  ylim(c(0,75000))
+
+#By year
+grid2 %>% ggplot( aes(year, demand,col=year)) +
+  geom_boxplot(outlier.shape=NA) + 
+  stat_boxplot(geom ='errorbar')+
+  xlab("Year") + ylab("Power consumption")+ggtitle('Power consumption by Year')+
+  ylim(c(15000,65000))+ theme(legend.position = "none")
+
+#By month
+grid2 %>% ggplot( aes(month, demand,col=month)) +
+  geom_boxplot(outlier.shape=NA) + 
+  stat_boxplot(geom ='errorbar')+
+  xlab("Month") + ylab("Power consumption")+ggtitle('Power consumption by Month')+
+  ylim(c(15000,65000))+ theme(legend.position = "none")
+
+#By week
+grid2 %>% ggplot(aes(as.factor(week), demand,col=as.factor(week))) +
+  geom_boxplot(outlier.shape=NA) + 
+  stat_boxplot(geom ='errorbar')+
+  xlab("Week") + ylab("Power consumption")+ggtitle('Power consumption by week')+
+  ylim(c(15000,65000))+ theme(legend.position = "none")
+
+```
+
+
+
+
+## Modelling
+
+I will model this data using a simple ARIMA model. 
+
+ARIMA models assume that the series is stationary. A series is said to be stationary when its mean, variance, and autocovariance are time invariant. From the plots above, this might not be entirely true. I will first test this assumption using the the augmented Dickey-Fuller (ADF) test:
+
+```{r adf, include=TRUE,echo=FALSE,warning=FALSE}
+#Augmented Dickey-Fuller (ADF) test
+adf.test(grid2$demand, alternative = "stationary")
+
+```
+
+The ADF test indicates that the null hypothesis can be rejected and that it is possible to consider this time series to be stationary.
+
+
+Since the goal is to build a predictive model, I will split the data in train and test sets in order to have a subset of data where the model was not trained on to evaluate its external validity. I will train the model using all the measurements before 2020 and test the model in the 2020 measurements.
+
+```{r train_test, include=TRUE,echo=FALSE,warning=FALSE}
+#Train-test split
+grid2 <- grid2 %>%
+  mutate(Model = ifelse(day <= "2019-12-31", "train", "test"))
+
+
+grid2 %>% ggplot(aes(x=day, y=demand,col=Model)) + geom_line() +
+  xlab("Time") + ylab("Power consumption")+ggtitle('Power consumption over time')+
+  ylim(c(0,75000))
+
+
+train<-grid2 %>% filter(Model=='train')
+test<-grid2 %>% filter(Model=='test')
+
+
+```
+
+
+For simplicity, I will only run an auto-ARIMA model using the ```auto.arima()``` method assuming stationarity and that there is seasonality. Below are the estimated parameters of the model and a plot of the residuals. The AIC could be used to compare with other models. The residuals plot show that most residuals are centered around 0 but they are large which suggests that some refinements could be made to reduce the residuals and improve predictive ability. However, I will evaluate the model performance on the test set using the current model.
+
+
+```{r arima, include=TRUE,echo=FALSE,warning=FALSE}
+#Auto-ARIMA
+fit<-auto.arima(train$demand,stationary = TRUE,seasonal = TRUE)
+
+print(fit)
+
+tsdisplay(residuals(fit), main='Model Residuals') 
+
+```
+
+
+### Model performance
+
+To evaluate model performance, I will use the 2020 test data and compare the model predictions with the real results.
+
+Below is a plot of the preditions and the real results for 2020. The predictions are a very smooth line that is not taking into account the different cycles in the data. However, the 80% CI makes a good gate around the results.
+
+
+
+
+```{r arima_performance, include=TRUE,echo=FALSE,warning=FALSE}
+#Forecast - same number of predictions as test
+fcast<-forecast(fit,h=nrow(test))
+
+test$pred<-fcast$mean
+
+
+test.long<-data.frame(
+  day=rep(test$day, times=4),
+  line=c(rep('Test data',times=nrow(test)),rep('Prediction',times=nrow(test)),rep('80% CI lower bound',times=nrow(test)),rep('80% CI upper bound',times=nrow(test))),
+  demand=c(test$demand,test$pred,fcast$lower[,1],fcast$upper[,1])
+)
+
+test.long %>% ggplot(aes(x=day, y=demand,col=line)) + geom_line() +
+  xlab("Time") + ylab("Power consumption")+ggtitle('Power consumption over time - Test data and forecast')+
+  ylim(c(0,75000))
+
+```
+
+<br>
+
+Model performance can also be quantifieds by mean error in predictions. Below is the performance of the model on the training and the test sets:
+
+```{r arima_performance2, include=TRUE,echo=FALSE,warning=FALSE}
+accuracy(fcast,x=test$demand)
+
+```
+
+As expected the errors are larger in the test set. Ideally, this difference would be small in order to ensure good model generalisability.
+
+
+<br>
+
+## Discussion
+
+This is a simple version of a model to forecast power consumption in the UK using publicly available data.
+
+This is a large dataset with multiple measurements on each day with scarce documentation. There is no explanation about the varying number of measurements in each day and little information about other variables in the dataset.
+
+This dataset also presented many outliers which created large spikes in the data thus making it a bit volatile. The current simplistic approach solved this problem by taking the mean measurement on each day but smoothing approaches should be considered to refine the model.
+
+Model performance is poor and the predictions are not detecting the obvious variations in consumption. It is important to note, however, that the quality of the predictions also depends and how good we need to be at predicting. That is, in practice the current error in prediction might be acceptable according to the requirements of the specific problem at hand.
+
+
+
